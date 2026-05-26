@@ -9,12 +9,14 @@ Random Mix Editor - PyQt6 + FFmpeg
    例如：B、B、C、A => 随机抽 B 一条 + 再随机抽 B 一条 + 随机抽 C 一条 + 随机抽 A 一条。
 4. 如果视频总时长不足音频时长，会继续按照导入顺序循环随机抽取，直到覆盖音频时长。
 5. 最终用 FFmpeg 合成 1080x1920、30fps、H.264/AAC 的 MP4。
+6. 可选添加字幕：优先读取随机 MP3 同目录同名 SRT；没有则尝试 Whispy / Whisper 自动识别生成。
 
 打包参考：
 # 开发调试：把 ffmpeg.exe 放在本 py 文件同目录即可。ffprobe.exe 可选；没有 ffprobe.exe 时会用 ffmpeg.exe 读取时长。
-# 打包 exe：把 ffmpeg.exe 一起封装进去，用户电脑无需安装 FFmpeg。
-python -m PyInstaller --onefile --windowed --add-binary "ffmpeg.exe;." --hidden-import PyQt6 random_mix_editor_pyqt6_v8_bundled_ffmpeg.py
+# 打包 exe：把 ffmpeg.exe 和 impact.ttf 一起封装进去，用户电脑无需安装 FFmpeg。
+python -m PyInstaller --onefile --windowed --add-binary "ffmpeg.exe;." --add-data "impact.ttf;." --hidden-import PyQt6 random_mix_editor.py
 # 如果同目录也有 ffprobe.exe，可额外加：--add-binary "ffprobe.exe;."
+# 如果需要自动识别字幕，请额外安装/打包 whispy、whisper 命令或 openai-whisper Python 库。
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
-from PyQt6.QtGui import QFont, QIcon, QColor, QPalette
+from PyQt6.QtGui import QFont, QIcon, QColor, QPalette, QPainter, QPen, QBrush, QPainterPath, QFontMetrics
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -49,6 +51,8 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QSpinBox,
     QCheckBox,
+    QColorDialog,
+    QSlider,
     QVBoxLayout,
     QWidget,
     QAbstractItemView,
@@ -64,6 +68,16 @@ AUDIO_EXTS = {".mp3"}
 OUTPUT_WIDTH = 1080
 OUTPUT_HEIGHT = 1920
 OUTPUT_FPS = 30
+DEFAULT_SUBTITLE_COLOR = "#FFFFFF"
+DEFAULT_SUBTITLE_OUTLINE_COLOR = "#000000"
+DEFAULT_SUBTITLE_SIZE = 42
+DEFAULT_SUBTITLE_OUTLINE_WIDTH = 3
+DEFAULT_SUBTITLE_MARGIN_V = 135
+SUBTITLE_MARGIN_MIN = 20
+SUBTITLE_MARGIN_MAX = 1760
+SUBTITLE_FONT_NAME = "Impact"
+SUBTITLE_SAFE_MARGIN_L = 70
+SUBTITLE_SAFE_MARGIN_R = 70
 
 
 # -----------------------------
@@ -71,10 +85,28 @@ OUTPUT_FPS = 30
 # -----------------------------
 
 def resource_path(relative_path: str) -> str:
-    """兼容 PyInstaller 打包后的资源路径。"""
+    """兼容 PyInstaller 打包后的只读资源路径。"""
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, relative_path)  # type: ignore[attr-defined]
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative_path)
+
+
+def app_base_dir() -> str:
+    """应用自身所在目录。用于保存 Whisper 模型等需要长期复用的文件。
+
+    注意：PyInstaller onefile 的 _MEIPASS 是临时解压目录，每次启动都可能变化，
+    不能用来保存模型缓存，否则会出现每次运行都重新下载模型的问题。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def app_writable_path(relative_path: str) -> str:
+    """返回应用目录下可写路径，并自动创建父目录。"""
+    path = os.path.join(app_base_dir(), relative_path)
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 def bundled_executable_candidates(name: str) -> List[str]:
@@ -244,6 +276,185 @@ def seconds_to_hms(seconds: float) -> str:
     return f"{m:02d}:{s:02d}"
 
 
+def seconds_to_srt_time(seconds: float) -> str:
+    """把秒数转换成 SRT 时间戳。"""
+    seconds = max(0.0, float(seconds))
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    whole_seconds = int(seconds % 60)
+    milliseconds = int(round((seconds - int(seconds)) * 1000))
+    if milliseconds >= 1000:
+        milliseconds -= 1000
+        whole_seconds += 1
+    return f"{hours:02d}:{minutes:02d}:{whole_seconds:02d},{milliseconds:03d}"
+
+
+def clean_subtitle_text(text: str) -> str:
+    return (text or "").strip().replace("\r", " ").replace("\n", " ")
+
+
+def hex_to_ass_color(hex_color: str) -> str:
+    """FFmpeg subtitles force_style 使用 ASS 颜色：&HAABBGGRR。"""
+    value = (hex_color or DEFAULT_SUBTITLE_COLOR).strip().lstrip("#")
+    if len(value) != 6:
+        value = DEFAULT_SUBTITLE_COLOR.lstrip("#")
+    rr, gg, bb = value[0:2], value[2:4], value[4:6]
+    return f"&H00{bb}{gg}{rr}"
+
+
+def srt_time_to_ass_time(value: str) -> str:
+    """把 SRT 时间戳转换成 ASS 时间戳：0:00:00.00。"""
+    value = (value or "").strip().replace(",", ".")
+    match = re.match(r"(?:(\d+):)?(\d{1,2}):(\d{1,2})(?:\.(\d{1,3}))?", value)
+    if not match:
+        return "0:00:00.00"
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0)
+    seconds = int(match.group(3) or 0)
+    ms = int((match.group(4) or "0").ljust(3, "0")[:3])
+    centiseconds = int(round(ms / 10))
+    if centiseconds >= 100:
+        centiseconds = 0
+        seconds += 1
+    if seconds >= 60:
+        seconds -= 60
+        minutes += 1
+    if minutes >= 60:
+        minutes -= 60
+        hours += 1
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def escape_ass_dialogue_text(text: str) -> str:
+    """转义 ASS Dialogue 文本，避免字幕内容被当成 ASS 样式标签。"""
+    value = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    value = re.sub(r"<[^>]+>", "", value)
+    value = value.replace("{", "(").replace("}", ")")
+    value = value.replace("\\", r"\\")
+    lines = [line.strip() for line in value.split("\n") if line.strip()]
+    return r"\N".join(lines)
+
+
+def parse_srt_cues(srt_path: str) -> List[Tuple[str, str, str]]:
+    """读取 SRT，返回 [(start_ass, end_ass, text_ass), ...]。"""
+    raw = Path(srt_path).read_text(encoding="utf-8-sig", errors="ignore")
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+
+    cues: List[Tuple[str, str, str]] = []
+    blocks = re.split(r"\n\s*\n", raw)
+    time_pattern = re.compile(
+        r"(?P<start>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*"
+        r"(?P<end>\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})"
+    )
+
+    for block in blocks:
+        lines = [line.strip("\ufeff") for line in block.split("\n") if line.strip()]
+        if not lines:
+            continue
+
+        time_index = -1
+        match = None
+        for idx, line in enumerate(lines):
+            match = time_pattern.search(line)
+            if match:
+                time_index = idx
+                break
+
+        if time_index < 0 or not match:
+            continue
+
+        text_lines = lines[time_index + 1:]
+        text_value = escape_ass_dialogue_text("\n".join(text_lines))
+        if not text_value:
+            continue
+
+        cues.append((
+            srt_time_to_ass_time(match.group("start")),
+            srt_time_to_ass_time(match.group("end")),
+            text_value,
+        ))
+
+    return cues
+
+
+def write_ass_from_srt(
+    srt_path: str,
+    ass_path: str,
+    font_name: str,
+    font_color: str,
+    outline_color: str,
+    outline_width: int,
+    font_size: int,
+    margin_v: int,
+):
+    """
+    把 SRT 转成带真实 1080x1920 分辨率的 ASS 字幕。
+    这样字体大小、描边和上下位置会和最终视频坐标一致，不会因为 FFmpeg 默认 ASS 分辨率导致字幕跑到画面外。
+    """
+    cues = parse_srt_cues(srt_path)
+    if not cues:
+        raise RuntimeError(f"SRT 文件没有有效字幕片段：{srt_path}")
+
+    primary_color = hex_to_ass_color(font_color)
+    outline = hex_to_ass_color(outline_color)
+    font_size = max(12, min(120, int(font_size or DEFAULT_SUBTITLE_SIZE)))
+    outline_width = max(0, min(12, int(outline_width if outline_width is not None else DEFAULT_SUBTITLE_OUTLINE_WIDTH)))
+    # ASS 的 MarginV 在这里按 1080x1920 真实画布解释。
+    margin_v = max(SUBTITLE_MARGIN_MIN, min(SUBTITLE_MARGIN_MAX, int(margin_v or DEFAULT_SUBTITLE_MARGIN_V)))
+
+    margin_l = SUBTITLE_SAFE_MARGIN_L
+    margin_r = SUBTITLE_SAFE_MARGIN_R
+    shadow = 0
+
+    lines = [
+        "[Script Info]",
+        "ScriptType: v4.00+",
+        "Collisions: Normal",
+        f"PlayResX: {OUTPUT_WIDTH}",
+        f"PlayResY: {OUTPUT_HEIGHT}",
+        "Timer: 100.0000",
+        "WrapStyle: 0",
+        "ScaledBorderAndShadow: yes",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
+        "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        f"Style: Default,{font_name},{font_size},{primary_color},&H000000FF,{outline},&H64000000,"
+        f"-1,0,0,0,100,100,0,0,1,{outline_width},{shadow},2,{margin_l},{margin_r},{margin_v},1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+    for start, end, content in cues:
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{content}")
+
+    Path(ass_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def escape_ffmpeg_filter_path(path: str) -> str:
+    """给 subtitles/fontsdir 过滤器参数使用的路径转义，兼容 Windows 盘符和空格。"""
+    fixed = os.path.abspath(path).replace("\\", "/")
+    fixed = fixed.replace("'", r"\\'")
+    fixed = fixed.replace(":", r"\:")
+    return fixed
+
+
+def find_optional_command(names: List[str]) -> str:
+    """查找可选外部命令：优先应用自身目录，再允许 PATH 里的开发环境命令。"""
+    for name in names:
+        for candidate in bundled_executable_candidates(name):
+            if os.path.exists(candidate):
+                return candidate
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
 @dataclass
 class GpuAccelerationInfo:
     available: bool
@@ -264,6 +475,13 @@ class MixJobConfig:
     gpu_enabled: bool = False
     gpu_encoder: str = ""
     gpu_vendor: str = ""
+    subtitle_enabled: bool = False
+    subtitle_font_color: str = DEFAULT_SUBTITLE_COLOR
+    subtitle_outline_color: str = DEFAULT_SUBTITLE_OUTLINE_COLOR
+    subtitle_outline_width: int = DEFAULT_SUBTITLE_OUTLINE_WIDTH
+    subtitle_font_size: int = DEFAULT_SUBTITLE_SIZE
+    subtitle_margin_v: int = DEFAULT_SUBTITLE_MARGIN_V
+    subtitle_font_path: str = ""
 
 
 # -----------------------------
@@ -396,6 +614,102 @@ class MixWorker(QThread):
             raise RuntimeError(f"媒体时长无效：{media_path}")
         return duration
 
+    def resolve_subtitle_for_audio(self, audio_path: str) -> str:
+        """字幕开启时：优先读取同名 SRT；没有就自动识别并保存到音频同目录。"""
+        srt_path = str(Path(audio_path).with_suffix(".srt"))
+        if os.path.exists(srt_path):
+            self.log.emit(f"字幕：已找到同名 SRT：{Path(srt_path).name}")
+            return srt_path
+
+        self.log.emit("字幕：未找到同名 SRT，开始调用 Whispy / Whisper 自动识别...")
+        self.generate_srt_from_audio(audio_path, srt_path)
+        if not os.path.exists(srt_path):
+            raise RuntimeError("字幕识别完成后仍未生成 SRT 文件。")
+        self.log.emit(f"字幕：已生成并保存：{Path(srt_path).name}")
+        return srt_path
+
+    def generate_srt_from_audio(self, audio_path: str, srt_path: str):
+        """
+        自动字幕识别：
+        1. 优先尝试 whispy / whisper 命令行；
+        2. 如果没有命令行，再尝试 Python openai-whisper 库；
+        3. 都不可用时，提示用户安装识别依赖或手动放同名 srt。
+        """
+        output_dir = str(Path(srt_path).parent)
+        expected_name = Path(srt_path).name
+
+        # 兼容用户说的 whispy，也兼容 OpenAI Whisper CLI 的 whisper 命令。
+        command_candidates: List[List[str]] = []
+        whispy_cmd = find_optional_command(["whispy.exe", "whispy"])
+        if whispy_cmd:
+            command_candidates.append([whispy_cmd, audio_path, "--output_format", "srt", "--output_dir", output_dir])
+            command_candidates.append([whispy_cmd, audio_path, "--output", srt_path])
+
+        whisper_cmd = find_optional_command(["whisper.exe", "whisper"])
+        if whisper_cmd:
+            command_candidates.append([
+                whisper_cmd,
+                audio_path,
+                "--model", "base",
+                "--output_format", "srt",
+                "--output_dir", output_dir,
+            ])
+
+        for cmd in command_candidates:
+            try:
+                self.log.emit(f"字幕：尝试命令行识别：{Path(cmd[0]).name}")
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="ignore",
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+                # whisper CLI 默认会在 output_dir 里生成同名 srt。
+                if os.path.exists(srt_path):
+                    return
+                generated = Path(output_dir) / expected_name
+                if generated.exists():
+                    return
+                if result.returncode != 0 and result.stderr:
+                    self.log.emit(result.stderr[-800:])
+            except Exception as exc:
+                self.log.emit(f"字幕：命令行识别失败：{exc}")
+
+        # Python 库兜底：pip install openai-whisper
+        try:
+            self.log.emit("字幕：尝试 Python Whisper 库识别。首次运行可能需要下载模型。")
+            import whisper  # type: ignore
+
+            whisper_model_dir = app_writable_path("whisper_models")
+            self.log.emit(f"字幕：Whisper 模型缓存目录：{whisper_model_dir}")
+            model = whisper.load_model("base", download_root=whisper_model_dir)
+            result = model.transcribe(audio_path, fp16=False)
+            segments = result.get("segments", []) if isinstance(result, dict) else []
+            if not segments:
+                raise RuntimeError("Whisper 没有返回有效字幕片段。")
+
+            with open(srt_path, "w", encoding="utf-8") as f:
+                for idx, seg in enumerate(segments, start=1):
+                    start = seconds_to_srt_time(float(seg.get("start", 0)))
+                    end = seconds_to_srt_time(float(seg.get("end", 0)))
+                    content = clean_subtitle_text(str(seg.get("text", "")))
+                    if not content:
+                        continue
+                    f.write(f"{idx}\n{start} --> {end}\n{content}\n\n")
+            return
+        except Exception as exc:
+            raise RuntimeError(
+                "没有找到同名 SRT，且自动识别失败。\n"
+                "你可以：\n"
+                "1. 在音频同目录放一个同名 .srt；或\n"
+                "2. 安装/打包 whispy、whisper 命令；或\n"
+                "3. 安装 openai-whisper：pip install openai-whisper。\n"
+                f"原始错误：{exc}"
+            )
+
     def pick_video_sequence(self, audio_duration: float) -> List[str]:
         sequence: List[str] = []
         total = 0.0
@@ -429,6 +743,11 @@ class MixWorker(QThread):
         self.log.emit(f"\n[{index}/{self.config.output_count}] 随机音频：{Path(audio_path).name}")
         self.log.emit(f"音频时长：{seconds_to_hms(audio_duration)}")
 
+        subtitle_path = ""
+        if self.config.subtitle_enabled:
+            subtitle_path = self.resolve_subtitle_for_audio(audio_path)
+            self.log.emit(f"字幕样式：字体色 {self.config.subtitle_font_color} / 边框色 {self.config.subtitle_outline_color} / 边框粗细 {self.config.subtitle_outline_width} / 字号 {self.config.subtitle_font_size} / 位置 {self.config.subtitle_margin_v}")
+
         video_sequence = self.pick_video_sequence(audio_duration)
         self.log.emit("视频顺序：")
         for i, video in enumerate(video_sequence, start=1):
@@ -439,7 +758,7 @@ class MixWorker(QThread):
         output_name = f"mix_{timestamp}_{index:03d}_{audio_name}.mp4"
         output_path = os.path.join(self.config.output_folder, output_name)
 
-        self.run_ffmpeg(video_sequence, audio_path, audio_duration, output_path)
+        self.run_ffmpeg(video_sequence, audio_path, audio_duration, output_path, subtitle_path)
         self.log.emit(f"输出完成：{output_name}")
 
     def gpu_video_options(self) -> List[str]:
@@ -471,6 +790,7 @@ class MixWorker(QThread):
         audio_duration: float,
         output_path: str,
         use_gpu: bool,
+        subtitle_path: str = "",
     ) -> List[str]:
         cmd = [self.config.ffmpeg_path, "-hide_banner", "-y"]
 
@@ -491,7 +811,36 @@ class MixWorker(QThread):
             )
             concat_inputs.append(f"[v{i}]")
 
-        filter_parts.append("".join(concat_inputs) + f"concat=n={len(videos)}:v=1:a=0[vout]")
+        if subtitle_path:
+            filter_parts.append("".join(concat_inputs) + f"concat=n={len(videos)}:v=1:a=0[vjoin]")
+
+            # 之前直接用 SRT + force_style 时，FFmpeg/libass 会使用默认脚本分辨率，
+            # MarginV/FontSize 在部分机器上会被解释错，导致字幕实际跑到画面外，看起来像“没有字幕”。
+            # 这里先把 SRT 转成带 PlayResX/PlayResY=1080x1920 的 ASS，再烧录，位置和字号才稳定。
+            ass_path = os.path.splitext(output_path)[0] + "_subtitle.ass"
+            write_ass_from_srt(
+                subtitle_path,
+                ass_path,
+                SUBTITLE_FONT_NAME,
+                self.config.subtitle_font_color,
+                self.config.subtitle_outline_color,
+                self.config.subtitle_outline_width,
+                self.config.subtitle_font_size,
+                self.config.subtitle_margin_v,
+            )
+            ass_fixed = escape_ffmpeg_filter_path(ass_path)
+
+            if self.config.subtitle_font_path and os.path.exists(self.config.subtitle_font_path):
+                font_dir = escape_ffmpeg_filter_path(os.path.dirname(self.config.subtitle_font_path))
+            else:
+                font_dir = escape_ffmpeg_filter_path(os.path.dirname(resource_path("impact.ttf")))
+
+            filter_parts.append(
+                f"[vjoin]subtitles='{ass_fixed}':fontsdir='{font_dir}'[vout]"
+            )
+        else:
+            filter_parts.append("".join(concat_inputs) + f"concat=n={len(videos)}:v=1:a=0[vout]")
+
         filter_complex = ";".join(filter_parts)
 
         cmd.extend([
@@ -526,28 +875,39 @@ class MixWorker(QThread):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-    def run_ffmpeg(self, videos: List[str], audio_path: str, audio_duration: float, output_path: str):
+    def run_ffmpeg(self, videos: List[str], audio_path: str, audio_duration: float, output_path: str, subtitle_path: str = ""):
         use_gpu = bool(self.config.gpu_enabled and self.config.gpu_encoder)
-        if use_gpu:
-            self.log.emit(f"开始 FFmpeg 合成... 使用 GPU 硬件编码：{self.config.gpu_vendor} / {self.config.gpu_encoder}")
-            cmd = self.build_ffmpeg_command(videos, audio_path, audio_duration, output_path, use_gpu=True)
-            result = self.execute_ffmpeg_command(cmd)
-            if result.returncode == 0:
-                return
+        subtitle_note = "，并烧录字幕" if subtitle_path else ""
+        temp_ass_path = os.path.splitext(output_path)[0] + "_subtitle.ass" if subtitle_path else ""
 
-            # 硬件编码对驱动/FFmpeg 版本比较敏感。即使启动时检测可用，也可能因驱动占用或素材异常失败。
-            # 这里自动回退 CPU，避免用户任务直接中断。
-            self.log.emit("GPU 编码失败，已自动回退 CPU 编码继续生成。")
-            if result.stderr:
-                self.log.emit(result.stderr[-1200:])
+        try:
+            if use_gpu:
+                self.log.emit(f"开始 FFmpeg 合成{subtitle_note}... 使用 GPU 硬件编码：{self.config.gpu_vendor} / {self.config.gpu_encoder}")
+                cmd = self.build_ffmpeg_command(videos, audio_path, audio_duration, output_path, use_gpu=True, subtitle_path=subtitle_path)
+                result = self.execute_ffmpeg_command(cmd)
+                if result.returncode == 0:
+                    return
 
-        else:
-            self.log.emit("开始 FFmpeg 合成... 使用 CPU 编码。")
+                # 硬件编码对驱动/FFmpeg 版本比较敏感。即使启动时检测可用，也可能因驱动占用或素材异常失败。
+                # 这里自动回退 CPU，避免用户任务直接中断。
+                self.log.emit("GPU 编码失败，已自动回退 CPU 编码继续生成。")
+                if result.stderr:
+                    self.log.emit(result.stderr[-1200:])
 
-        cpu_cmd = self.build_ffmpeg_command(videos, audio_path, audio_duration, output_path, use_gpu=False)
-        cpu_result = self.execute_ffmpeg_command(cpu_cmd)
-        if cpu_result.returncode != 0:
-            raise RuntimeError(f"FFmpeg 合成失败：\n{cpu_result.stderr[-4000:]}")
+            else:
+                self.log.emit(f"开始 FFmpeg 合成{subtitle_note}... 使用 CPU 编码。")
+
+            cpu_cmd = self.build_ffmpeg_command(videos, audio_path, audio_duration, output_path, use_gpu=False, subtitle_path=subtitle_path)
+            cpu_result = self.execute_ffmpeg_command(cpu_cmd)
+            if cpu_result.returncode != 0:
+                raise RuntimeError(f"FFmpeg 合成失败：\n{cpu_result.stderr[-4000:]}")
+        finally:
+            # ASS 只是为了稳定烧录字幕的中间文件。合成结束后自动删除，避免输出目录里多出 _subtitle.ass。
+            if temp_ass_path and os.path.exists(temp_ass_path):
+                try:
+                    os.remove(temp_ass_path)
+                except Exception:
+                    pass
 
 
 # -----------------------------
@@ -1021,6 +1381,254 @@ class CountStepper(QWidget):
     def decrease(self):
         self.setValue(self._value - 1)
 
+
+class SubtitlePreviewLabel(QLabel):
+    """用 QPainter 绘制带描边的字幕预览，并按预览画布宽度自动换行。"""
+    def __init__(self, text: str = "Your final captions will automatically wrap\ninside this 9:16 video preview canvas."):
+        super().__init__(text)
+        self.font_color = QColor(DEFAULT_SUBTITLE_COLOR)
+        self.outline_color = QColor(DEFAULT_SUBTITLE_OUTLINE_COLOR)
+        self.final_font_size = DEFAULT_SUBTITLE_SIZE
+        self.final_outline_width = DEFAULT_SUBTITLE_OUTLINE_WIDTH
+        self.setWordWrap(False)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # 这里必须保持透明，黑色底色由父级 9:16 画布负责。
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setStyleSheet("background: transparent; border: none;")
+
+    def _preview_scale(self) -> float:
+        # 最终字幕是在 1080x1920 的 ASS 画布上渲染的。
+        # 预览文字区域对应最终字幕安全宽度：1080 - 左右边距。
+        # 用真实宽度比例缩放，避免预览和成片字号差异过大。
+        final_text_width = max(1, OUTPUT_WIDTH - SUBTITLE_SAFE_MARGIN_L - SUBTITLE_SAFE_MARGIN_R)
+        current_width = max(1, self.width() or int(final_text_width * 0.24))
+        return current_width / final_text_width
+
+    def _preview_font_size(self) -> int:
+        # 预览框很小，完全等比缩放时文字可能过小。这里保留等比关系，但给一个可见下限。
+        return max(12, min(38, int(round(self.final_font_size * self._preview_scale()))))
+
+    def _font(self) -> QFont:
+        return QFont(SUBTITLE_FONT_NAME, self._preview_font_size(), QFont.Weight.Black)
+
+    def set_subtitle_style(self, font_color: str, outline_color: str, font_size: int, outline_width: int = DEFAULT_SUBTITLE_OUTLINE_WIDTH):
+        self.font_color = QColor(font_color or DEFAULT_SUBTITLE_COLOR)
+        self.outline_color = QColor(outline_color or DEFAULT_SUBTITLE_OUTLINE_COLOR)
+        self.final_font_size = max(14, min(120, int(font_size or DEFAULT_SUBTITLE_SIZE)))
+        self.final_outline_width = max(0, min(12, int(outline_width if outline_width is not None else DEFAULT_SUBTITLE_OUTLINE_WIDTH)))
+        self.updateGeometry()
+        self.update()
+
+    def _wrap_paragraph(self, paragraph: str, metrics: QFontMetrics, max_width: int) -> List[str]:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            return []
+
+        words = paragraph.split()
+        if not words:
+            return []
+
+        lines: List[str] = []
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if metrics.horizontalAdvance(candidate) <= max_width:
+                current = candidate
+                continue
+
+            if current:
+                lines.append(current)
+                current = word
+            else:
+                # 极端情况：一个超长单词也不能超出屏幕，按字符拆分。
+                chunk = ""
+                for ch in word:
+                    test = chunk + ch
+                    if metrics.horizontalAdvance(test) <= max_width or not chunk:
+                        chunk = test
+                    else:
+                        lines.append(chunk)
+                        chunk = ch
+                current = chunk
+
+        if current:
+            lines.append(current)
+        return lines
+
+    def wrapped_lines(self, available_width: int) -> List[str]:
+        font = self._font()
+        metrics = QFontMetrics(font)
+        max_width = max(40, available_width - 2)
+        lines: List[str] = []
+        for paragraph in self.text().split("\n"):
+            wrapped = self._wrap_paragraph(paragraph, metrics, max_width)
+            lines.extend(wrapped)
+        return lines
+
+    def required_height(self, available_width: int) -> int:
+        font = self._font()
+        metrics = QFontMetrics(font)
+        lines = self.wrapped_lines(available_width)
+        if not lines:
+            return 0
+        return max(44, metrics.height() * len(lines) + 14)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+
+        font = self._font()
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        lines = self.wrapped_lines(self.width())
+        if not lines:
+            return
+
+        line_height = metrics.height()
+        total_height = line_height * len(lines)
+        y = (self.height() - total_height) / 2 + metrics.ascent()
+        outline_width = 0 if self.final_outline_width <= 0 else max(1, int(round(self.final_outline_width * self._preview_scale())))
+
+        for line in lines:
+            width = metrics.horizontalAdvance(line)
+            x = (self.width() - width) / 2
+            path = QPainterPath()
+            path.addText(x, y, font, line)
+            if outline_width > 0:
+                painter.setPen(QPen(self.outline_color, outline_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                painter.setBrush(QBrush(self.font_color))
+                painter.drawPath(path)
+            painter.fillPath(path, QBrush(self.font_color))
+            y += line_height
+
+
+class PhoneSubtitlePreview(Card):
+    """中间 9:16 黑色画布字幕预览，只展示字幕样式，不参与实际渲染。"""
+    SCREEN_WIDTH = 252
+    SCREEN_HEIGHT = 448  # 252:448 = 9:16
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumHeight(520)
+        self._last_enabled = False
+        self._last_color = DEFAULT_SUBTITLE_COLOR
+        self._last_outline_color = DEFAULT_SUBTITLE_OUTLINE_COLOR
+        self._last_outline_width = DEFAULT_SUBTITLE_OUTLINE_WIDTH
+        self._last_font_size = DEFAULT_SUBTITLE_SIZE
+        self._last_margin_v = DEFAULT_SUBTITLE_MARGIN_V
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(18, 15, 18, 18)
+        outer.setSpacing(12)
+
+        title = QLabel("字幕预览")
+        title.setStyleSheet("color:#0F172A; font-size:16px; font-weight:800; border:none; background:transparent;")
+        desc = QLabel("中间黑色画布按最终 1080×1920 成片坐标等比预览，用来判断字幕颜色、描边、字号和上下位置。")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#64748B; font-size:12px; border:none; background:transparent;")
+        outer.addWidget(title)
+        outer.addWidget(desc)
+
+        preview_wrap = QWidget()
+        preview_wrap.setStyleSheet("background:transparent; border:none;")
+        preview_layout = QHBoxLayout(preview_wrap)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.addStretch()
+
+        # 外层手机壳只做装饰，真正可见的 9:16 边界是里面的黑色 screen。
+        self.phone = QFrame()
+        self.phone.setObjectName("PhoneFrame")
+        self.phone.setFixedSize(286, 496)
+        self.phone.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.phone.setStyleSheet("""
+            QFrame#PhoneFrame {
+                background: #020617;
+                border: 1px solid #111827;
+                border-radius: 36px;
+            }
+        """)
+        phone_inner = QVBoxLayout(self.phone)
+        phone_inner.setContentsMargins(17, 24, 17, 24)
+        phone_inner.setSpacing(0)
+
+        self.screen = QFrame()
+        self.screen.setObjectName("PhoneScreen")
+        self.screen.setFixedSize(self.SCREEN_WIDTH, self.SCREEN_HEIGHT)
+        self.screen.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.screen.setAutoFillBackground(True)
+        self.screen.setStyleSheet("""
+            QFrame#PhoneScreen {
+                background-color: #000000;
+                border: 2px solid #1E293B;
+                border-radius: 0px;
+            }
+        """)
+
+        self.subtitle_label = SubtitlePreviewLabel()
+        self.subtitle_label.setParent(self.screen)
+        self.subtitle_label.raise_()
+
+        phone_inner.addWidget(self.screen, alignment=Qt.AlignmentFlag.AlignCenter)
+        preview_layout.addWidget(self.phone)
+        preview_layout.addStretch()
+        outer.addWidget(preview_wrap, 1)
+
+        self.update_subtitle(False, DEFAULT_SUBTITLE_COLOR, DEFAULT_SUBTITLE_OUTLINE_COLOR, DEFAULT_SUBTITLE_OUTLINE_WIDTH, DEFAULT_SUBTITLE_SIZE, DEFAULT_SUBTITLE_MARGIN_V)
+
+    def _position_subtitle_label(self, margin_v: int, centered: bool = False):
+        screen_w = self.SCREEN_WIDTH
+        screen_h = self.SCREEN_HEIGHT
+
+        # ASS 成片里左右安全边距是 70 / 1080。这里按同样比例映射到预览画布，
+        # 这样自动换行宽度、字幕横向范围会更接近最终视频。
+        scale_x = screen_w / OUTPUT_WIDTH
+        scale_y = screen_h / OUTPUT_HEIGHT
+        left_margin = int(round(SUBTITLE_SAFE_MARGIN_L * scale_x))
+        right_margin = int(round(SUBTITLE_SAFE_MARGIN_R * scale_x))
+        label_w = max(80, screen_w - left_margin - right_margin)
+
+        self.subtitle_label.setFixedWidth(label_w)
+        label_h = self.subtitle_label.required_height(label_w)
+        label_h = max(24, min(screen_h - 16, label_h))
+        self.subtitle_label.setFixedHeight(label_h)
+
+        x = int(round(left_margin))
+        if centered:
+            y = int((screen_h - label_h) / 2)
+        else:
+            margin_v = max(SUBTITLE_MARGIN_MIN, min(SUBTITLE_MARGIN_MAX, int(margin_v or DEFAULT_SUBTITLE_MARGIN_V)))
+            # ASS Alignment=2 时 MarginV 是“距离底部”的真实 1080x1920 坐标。
+            # 这里不再用百分比重映射，而是直接按 448/1920 等比换算。
+            bottom_margin = int(round(margin_v * scale_y))
+            y = screen_h - bottom_margin - label_h
+            y = max(8, min(screen_h - label_h - 8, y))
+
+        self.subtitle_label.setGeometry(x, y, label_w, label_h)
+        self.subtitle_label.raise_()
+        self.subtitle_label.setVisible(True)
+        self.subtitle_label.update()
+        self.screen.update()
+
+    def update_subtitle(self, enabled: bool, color: str, outline_color: str, outline_width: int, font_size: int, margin_v: int):
+        self._last_enabled = enabled
+        self._last_color = color
+        self._last_outline_color = outline_color
+        self._last_outline_width = max(0, min(12, int(outline_width if outline_width is not None else DEFAULT_SUBTITLE_OUTLINE_WIDTH)))
+        self._last_font_size = max(14, min(120, int(font_size or DEFAULT_SUBTITLE_SIZE)))
+        self._last_margin_v = max(SUBTITLE_MARGIN_MIN, min(SUBTITLE_MARGIN_MAX, int(margin_v or DEFAULT_SUBTITLE_MARGIN_V)))
+
+        if not enabled:
+            self.subtitle_label.setText("Captions are currently turned off. Enable subtitles to preview how text will look on the final 9:16 video.")
+            self.subtitle_label.set_subtitle_style("#64748B", "#000000", 34, DEFAULT_SUBTITLE_OUTLINE_WIDTH)
+            self._position_subtitle_label(self._last_margin_v, centered=True)
+            return
+
+        self.subtitle_label.setText("Your final captions will automatically wrap inside this 9:16 video preview canvas.")
+        self.subtitle_label.set_subtitle_style(color, outline_color, self._last_font_size, self._last_outline_width)
+        self._position_subtitle_label(self._last_margin_v)
+
+
 # -----------------------------
 # Main Window
 # -----------------------------
@@ -1028,8 +1636,8 @@ class CountStepper(QWidget):
 class RandomMixEditor(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("矩阵编导 v1.8")
-        self.setMinimumSize(1120, 760)
+        self.setWindowTitle("矩阵编导 v2.0")
+        self.setMinimumSize(1500, 840)
         self.video_folders: List[str] = []
         self.selected_index: Optional[int] = None
         self.worker: Optional[MixWorker] = None
@@ -1038,6 +1646,21 @@ class RandomMixEditor(QMainWindow):
         self.ffprobe_path = find_executable("ffprobe.exe")
         self.gpu_info = detect_gpu_acceleration(self.ffmpeg_path)
         self.gpu_checkbox: Optional[QCheckBox] = None
+        self.subtitle_checkbox: Optional[QCheckBox] = None
+        self.subtitle_color = DEFAULT_SUBTITLE_COLOR
+        self.subtitle_outline_color = DEFAULT_SUBTITLE_OUTLINE_COLOR
+        self.subtitle_outline_width = DEFAULT_SUBTITLE_OUTLINE_WIDTH
+        self.subtitle_size = DEFAULT_SUBTITLE_SIZE
+        self.subtitle_position = DEFAULT_SUBTITLE_MARGIN_V
+        self.subtitle_color_button: Optional[QPushButton] = None
+        self.subtitle_outline_color_button: Optional[QPushButton] = None
+        self.subtitle_outline_width_slider: Optional[QSlider] = None
+        self.subtitle_outline_width_label: Optional[QLabel] = None
+        self.subtitle_size_slider: Optional[QSlider] = None
+        self.subtitle_size_label: Optional[QLabel] = None
+        self.subtitle_position_slider: Optional[QSlider] = None
+        self.subtitle_position_label: Optional[QLabel] = None
+        self.phone_preview: Optional[PhoneSubtitlePreview] = None
 
         self.init_ui()
 
@@ -1130,7 +1753,12 @@ class RandomMixEditor(QMainWindow):
 
         left = QVBoxLayout()
         left.setSpacing(14)
-        body.addLayout(left, 8)
+        body.addLayout(left, 7)
+
+        center = QVBoxLayout()
+        center.setSpacing(14)
+        center.setContentsMargins(0, 0, 0, 0)
+        body.addLayout(center, 4)
 
         right = QVBoxLayout()
         right.setSpacing(14)
@@ -1263,7 +1891,14 @@ class RandomMixEditor(QMainWindow):
 
         left.addWidget(setting_card)
 
-        # Right preview card - compact
+        # Center subtitle preview + subtitle controls
+        self.phone_preview = PhoneSubtitlePreview()
+        center.addWidget(self.phone_preview, 1)
+        subtitle_card = self.build_subtitle_settings_card()
+        center.addWidget(subtitle_card)
+        center.addStretch(1)
+
+        # Right preview card - keep original compact layout
         preview_card = Card()
         preview_card.setFixedHeight(170)
         preview_layout = QVBoxLayout(preview_card)
@@ -1307,6 +1942,218 @@ class RandomMixEditor(QMainWindow):
         if self.gpu_info.available:
             self.append_log(f"已检测到可用 GPU 加速：{self.gpu_info.vendor} / {self.gpu_info.encoder}。已默认开启。")
         self.refresh_folder_list()
+
+    def build_subtitle_settings_card(self) -> Card:
+        card = Card()
+        card.setMaximumHeight(270)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 15, 18, 16)
+        layout.setSpacing(12)
+
+        head = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_box.setSpacing(4)
+        title = QLabel("字幕设置")
+        title.setStyleSheet("color:#0F172A; font-size:16px; font-weight:800; border:none; background:transparent;")
+        desc = QLabel("可选。优先读取同名 SRT；没有时自动调用 Whispy / Whisper 识别并保存。")
+        desc.setWordWrap(True)
+        desc.setStyleSheet("color:#64748B; font-size:12px; border:none; background:transparent;")
+        title_box.addWidget(title)
+        title_box.addWidget(desc)
+        head.addLayout(title_box, 1)
+
+        self.subtitle_checkbox = QCheckBox("启用字幕")
+        self.subtitle_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.subtitle_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #334155;
+                font-size: 13px;
+                font-weight: 800;
+                border: none;
+                background: transparent;
+                spacing: 8px;
+            }
+            QCheckBox:hover { color:#0F172A; }
+        """)
+        self.subtitle_checkbox.stateChanged.connect(self.update_subtitle_controls)
+        head.addWidget(self.subtitle_checkbox, alignment=Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(head)
+
+        color_grid = QGridLayout()
+        color_grid.setHorizontalSpacing(12)
+        color_grid.setVerticalSpacing(6)
+        font_color_label = QLabel("字体颜色")
+        font_color_label.setStyleSheet("color:#334155; font-size:12px; font-weight:700; border:none; background:transparent;")
+        outline_color_label = QLabel("字体边框颜色")
+        outline_color_label.setStyleSheet("color:#334155; font-size:12px; font-weight:700; border:none; background:transparent;")
+
+        self.subtitle_color_button = QPushButton(self.subtitle_color)
+        self.subtitle_color_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.subtitle_color_button.setMinimumHeight(38)
+        self.subtitle_color_button.clicked.connect(self.choose_subtitle_color)
+
+        self.subtitle_outline_color_button = QPushButton(self.subtitle_outline_color)
+        self.subtitle_outline_color_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.subtitle_outline_color_button.setMinimumHeight(38)
+        self.subtitle_outline_color_button.clicked.connect(self.choose_subtitle_outline_color)
+
+        color_grid.addWidget(font_color_label, 0, 0)
+        color_grid.addWidget(outline_color_label, 0, 1)
+        color_grid.addWidget(self.subtitle_color_button, 1, 0)
+        color_grid.addWidget(self.subtitle_outline_color_button, 1, 1)
+        color_grid.setColumnStretch(0, 1)
+        color_grid.setColumnStretch(1, 1)
+        layout.addLayout(color_grid)
+
+        self.subtitle_outline_width_slider = self.create_subtitle_slider(0, 12, self.subtitle_outline_width)
+        self.subtitle_outline_width_slider.valueChanged.connect(self.on_subtitle_outline_width_changed)
+        self.subtitle_outline_width_label = self.create_value_label(str(self.subtitle_outline_width))
+        layout.addLayout(self.make_slider_row("边框粗细", self.subtitle_outline_width_slider, self.subtitle_outline_width_label))
+
+        self.subtitle_size_slider = self.create_subtitle_slider(18, 76, self.subtitle_size)
+        self.subtitle_size_slider.valueChanged.connect(self.on_subtitle_size_changed)
+        self.subtitle_size_label = self.create_value_label(str(self.subtitle_size))
+        layout.addLayout(self.make_slider_row("字体大小", self.subtitle_size_slider, self.subtitle_size_label))
+
+        self.subtitle_position_slider = self.create_subtitle_slider(SUBTITLE_MARGIN_MIN, SUBTITLE_MARGIN_MAX, self.subtitle_position)
+        self.subtitle_position_slider.valueChanged.connect(self.on_subtitle_position_changed)
+        self.subtitle_position_label = self.create_value_label(self.format_subtitle_position(self.subtitle_position))
+        layout.addLayout(self.make_slider_row("字体位置", self.subtitle_position_slider, self.subtitle_position_label))
+
+        self.refresh_subtitle_color_buttons()
+        self.update_subtitle_controls()
+        return card
+
+    def create_subtitle_slider(self, minimum: int, maximum: int, value: int) -> QSlider:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(minimum, maximum)
+        slider.setValue(value)
+        slider.setCursor(Qt.CursorShape.PointingHandCursor)
+        slider.setStyleSheet("""
+            QSlider { border:none; background:transparent; }
+            QSlider::groove:horizontal {
+                height: 6px;
+                background: #E2E8F0;
+                border-radius: 3px;
+            }
+            QSlider::handle:horizontal {
+                width: 18px;
+                height: 18px;
+                margin: -7px 0;
+                background: #111827;
+                border-radius: 9px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #111827;
+                border-radius: 3px;
+            }
+        """)
+        return slider
+
+    def create_value_label(self, text: str) -> QLabel:
+        label = QLabel(text)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setFixedWidth(66)
+        label.setStyleSheet("color:#0F172A; font-size:12px; font-weight:800; border:none; background:transparent;")
+        return label
+
+    def make_slider_row(self, label_text: str, slider: QSlider, value_label: QLabel) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(10)
+        label = QLabel(label_text)
+        label.setFixedWidth(112)
+        label.setStyleSheet("color:#334155; font-size:12px; font-weight:700; border:none; background:transparent;")
+        row.addWidget(label)
+        row.addWidget(slider, 1)
+        row.addWidget(value_label)
+        return row
+
+    def refresh_subtitle_color_buttons(self):
+        def style_button(btn: Optional[QPushButton], color: str):
+            if not btn:
+                return
+            text_color = '#0F172A' if color.upper() in ['#FFFFFF', '#FFFF00', '#00FFFF'] else '#FFFFFF'
+            btn.setText(color.upper())
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {color};
+                    color: {text_color};
+                    border: 1px solid #CBD5E1;
+                    border-radius: 12px;
+                    font-size: 12px;
+                    font-weight: 800;
+                }}
+                QPushButton:hover {{ border: 2px solid #111827; }}
+                QPushButton:disabled {{ background:#E2E8F0; color:#94A3B8; }}
+            """)
+        style_button(self.subtitle_color_button, self.subtitle_color)
+        style_button(self.subtitle_outline_color_button, self.subtitle_outline_color)
+
+    def choose_subtitle_color(self):
+        color = QColorDialog.getColor(QColor(self.subtitle_color), self, "选择字幕颜色")
+        if color.isValid():
+            self.subtitle_color = color.name().upper()
+            self.refresh_subtitle_color_buttons()
+            self.update_subtitle_preview()
+
+    def choose_subtitle_outline_color(self):
+        color = QColorDialog.getColor(QColor(self.subtitle_outline_color), self, "选择字体边框颜色")
+        if color.isValid():
+            self.subtitle_outline_color = color.name().upper()
+            self.refresh_subtitle_color_buttons()
+            self.update_subtitle_preview()
+
+    def on_subtitle_outline_width_changed(self, value: int):
+        self.subtitle_outline_width = int(value)
+        if self.subtitle_outline_width_label:
+            self.subtitle_outline_width_label.setText(str(value))
+        self.update_subtitle_preview()
+
+    def on_subtitle_size_changed(self, value: int):
+        self.subtitle_size = int(value)
+        if self.subtitle_size_label:
+            self.subtitle_size_label.setText(str(value))
+        self.update_subtitle_preview()
+
+    def format_subtitle_position(self, value: int) -> str:
+        value = max(SUBTITLE_MARGIN_MIN, min(SUBTITLE_MARGIN_MAX, int(value)))
+        percent = int(round((value - SUBTITLE_MARGIN_MIN) / (SUBTITLE_MARGIN_MAX - SUBTITLE_MARGIN_MIN) * 100))
+        return f"{percent}%"
+
+    def on_subtitle_position_changed(self, value: int):
+        self.subtitle_position = int(value)
+        if self.subtitle_position_label:
+            self.subtitle_position_label.setText(self.format_subtitle_position(value))
+        self.update_subtitle_preview()
+
+    def update_subtitle_controls(self):
+        enabled = bool(self.subtitle_checkbox and self.subtitle_checkbox.isChecked())
+        for widget in [
+            self.subtitle_color_button,
+            self.subtitle_outline_color_button,
+            self.subtitle_outline_width_slider,
+            self.subtitle_outline_width_label,
+            self.subtitle_size_slider,
+            self.subtitle_size_label,
+            self.subtitle_position_slider,
+            self.subtitle_position_label,
+        ]:
+            if widget:
+                widget.setEnabled(enabled)
+        self.update_subtitle_preview()
+
+    def update_subtitle_preview(self):
+        enabled = bool(self.subtitle_checkbox and self.subtitle_checkbox.isChecked())
+        if self.phone_preview:
+            self.phone_preview.update_subtitle(
+                enabled,
+                self.subtitle_color,
+                self.subtitle_outline_color,
+                self.subtitle_outline_width,
+                self.subtitle_size,
+                self.subtitle_position,
+            )
 
     def build_preview_panel(self) -> QWidget:
         panel = QWidget()
@@ -1512,6 +2359,8 @@ class RandomMixEditor(QMainWindow):
             return None
 
         use_gpu = bool(self.gpu_info.available and self.gpu_checkbox and self.gpu_checkbox.isChecked())
+        subtitle_enabled = bool(self.subtitle_checkbox and self.subtitle_checkbox.isChecked())
+        subtitle_font_path = resource_path("impact.ttf")
 
         return MixJobConfig(
             audio_folder=self.audio_picker.path,
@@ -1523,6 +2372,13 @@ class RandomMixEditor(QMainWindow):
             gpu_enabled=use_gpu,
             gpu_encoder=self.gpu_info.encoder if use_gpu else "",
             gpu_vendor=self.gpu_info.vendor if use_gpu else "",
+            subtitle_enabled=subtitle_enabled,
+            subtitle_font_color=self.subtitle_color,
+            subtitle_outline_color=self.subtitle_outline_color,
+            subtitle_outline_width=self.subtitle_outline_width,
+            subtitle_font_size=self.subtitle_size,
+            subtitle_margin_v=self.subtitle_position,
+            subtitle_font_path=subtitle_font_path,
         )
 
     def start_mix(self):
@@ -1544,6 +2400,10 @@ class RandomMixEditor(QMainWindow):
             self.append_log(f"编码方式：GPU 加速（{config.gpu_vendor} / {config.gpu_encoder}）")
         else:
             self.append_log("编码方式：CPU")
+        if config.subtitle_enabled:
+            self.append_log(f"字幕：已启用（字体色 {config.subtitle_font_color} / 边框色 {config.subtitle_outline_color} / 边框粗细 {config.subtitle_outline_width} / 字号 {config.subtitle_font_size} / 位置 {config.subtitle_margin_v} / 字体 Impact）")
+        else:
+            self.append_log("字幕：未启用")
 
         self.worker = MixWorker(config)
         self.worker.log.connect(self.append_log)
