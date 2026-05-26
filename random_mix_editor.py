@@ -1028,7 +1028,7 @@ class CountStepper(QWidget):
 class RandomMixEditor(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("随机混剪软件")
+        self.setWindowTitle("矩阵编导 v1.8")
         self.setMinimumSize(1120, 760)
         self.video_folders: List[str] = []
         self.selected_index: Optional[int] = None
@@ -1109,7 +1109,7 @@ class RandomMixEditor(QMainWindow):
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(4)
-        title = QLabel("随机混剪工作台")
+        title = QLabel("矩阵混剪台")
         title.setStyleSheet("color:#0F172A; font-size:28px; font-weight:800; border:none; background:transparent;")
         subtitle = QLabel("按你导入的视频文件夹顺序随机抽片段，用随机 MP3 的时长自动生成混剪成片。")
         subtitle.setStyleSheet("color:#64748B; font-size:13px; border:none; background:transparent;")
